@@ -177,7 +177,7 @@ cython_debug/
 
 # Ignore CSV files
 *.csv
-
+*.txt
 # Ignore JSON files
 *.json
 *.jsonl
