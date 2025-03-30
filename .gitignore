@@ -162,3 +162,44 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Ignore model files
+*.h5
+*.pth
+*.pt
+*.onnx
+*.tflite
+*.pb
+*.ckpt
+*.joblib
+*.pkl
+*.weights
+
+# Ignore CSV files
+*.csv
+
+# Ignore JSON files
+*.json
+*.jsonl
+# Ignore Transformer model weights
+**/transformers/**
+**/models/**
+**/checkpoints/**
+
+# Ignore large files and cache
+*.tar.gz
+*.zip
+*.tar
+*.rar
+*.7z
+*.bin
+
+# Ignore Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore logs and temporary files
+logs/
+*.log
+*.tmp
+*.bak
+*.safetensors
