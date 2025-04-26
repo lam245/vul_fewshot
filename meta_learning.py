@@ -11,7 +11,7 @@ from transformers import (
     AutoModel,
     T5ForConditionalGeneration,
     TrainingArguments,
-    Trainer,
+    Trainer,AdamW,
     set_seed
 )
 import re
@@ -624,7 +624,7 @@ class MAMLForVulnerabilityDetection:
         
         logger.info(f"Model saved to {output_dir}")
 
-def create_meta_tasks(df, tokenizer, n_tasks=10, k_shot=8, max_length=512):
+def create_meta_tasks(df, tokenizer, n_tasks=10, k_shot=8, max_length=512, model_type="codebert"):
     """Create meta-learning tasks from Big-Vul dataset"""
     tasks = []
     
@@ -652,8 +652,20 @@ def create_meta_tasks(df, tokenizer, n_tasks=10, k_shot=8, max_length=512):
         ])
         
         # Create datasets
-        support_dataset = VulnerabilityDataset(support_df, tokenizer, max_length=max_length, is_bigvul=True)
-        query_dataset = VulnerabilityDataset(query_df, tokenizer, max_length=max_length, is_bigvul=True)
+        support_dataset = VulnerabilityDataset(
+            support_df, 
+            tokenizer, 
+            max_length=max_length, 
+            is_bigvul=True,
+            model_type=model_type
+        )
+        query_dataset = VulnerabilityDataset(
+            query_df, 
+            tokenizer, 
+            max_length=max_length, 
+            is_bigvul=True,
+            model_type=model_type
+        )
         
         # Create dataloaders
         support_dataloader = DataLoader(support_dataset, batch_size=4, shuffle=True)
@@ -664,7 +676,7 @@ def create_meta_tasks(df, tokenizer, n_tasks=10, k_shot=8, max_length=512):
     logger.info(f"Created {len(tasks)} meta-learning tasks")
     return tasks
 
-def create_sven_task(sven_data, tokenizer, max_length=512):
+def create_sven_task(sven_data, tokenizer, max_length=512, model_type="codebert"):
     """Create a task from SVEN dataset for adaptation"""
     # Split data for support set (for adaptation) and test
     train_data, test_data = train_test_split(
@@ -672,8 +684,18 @@ def create_sven_task(sven_data, tokenizer, max_length=512):
     )
     
     # Create datasets
-    support_dataset = VulnerabilityDataset(train_data, tokenizer, max_length=max_length)
-    test_dataset = VulnerabilityDataset(test_data, tokenizer, max_length=max_length)
+    support_dataset = VulnerabilityDataset(
+        train_data, 
+        tokenizer, 
+        max_length=max_length,
+        model_type=model_type
+    )
+    test_dataset = VulnerabilityDataset(
+        test_data, 
+        tokenizer, 
+        max_length=max_length,
+        model_type=model_type
+    )
     
     # Create dataloaders
     support_dataloader = DataLoader(support_dataset, batch_size=4, shuffle=True)
@@ -698,7 +720,7 @@ def main():
         "meta_batch_size": 2,        
         "n_meta_tasks": 30,         
         "k_shot": 6,                 
-        "big_vul_sample_size": 5000, 
+        "big_vul_sample_size": 20000, 
         "meta_epochs": 3,           
         "ft_epochs": 10,             
         "seed": 42,
@@ -760,8 +782,7 @@ def main():
         maml.tokenizer, 
         n_tasks=config["n_meta_tasks"], 
         k_shot=config["k_shot"], 
-        max_length=config["max_length"],
-        model_type=config["model_type"]
+        max_length=config["max_length"]
     )
     
     # Create target task from SVEN
