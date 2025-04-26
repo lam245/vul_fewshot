@@ -8,6 +8,8 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import (
     RobertaForSequenceClassification,
     AutoTokenizer,
+    AutoModel,
+    T5ForConditionalGeneration,
     TrainingArguments,
     Trainer,
     set_seed
@@ -26,6 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # Set random seed for reproducibility
 def set_random_seed(seed=42):
     random.seed(seed)
@@ -36,9 +39,10 @@ def set_random_seed(seed=42):
     logger.info(f"Random seed set to {seed}")
 
 class SVENBinaryDataset(Dataset):
-    def __init__(self, examples, tokenizer, max_length=512):
+    def __init__(self, examples, tokenizer, max_length=512, model_type="codebert"):
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.model_type = model_type
         
         # Preprocess data to create binary classification samples
         self.processed_examples = []
@@ -76,11 +80,20 @@ class SVENBinaryDataset(Dataset):
         input_ids = inputs["input_ids"].squeeze()
         attention_mask = inputs["attention_mask"].squeeze()
         
-        return {
+        result = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": torch.tensor(example["label"], dtype=torch.long)
         }
+        
+        # For CodeT5, add decoder_input_ids
+        if self.model_type == "codet5":
+            # For classification, we don't need meaningful decoder inputs
+            # Just use a simple start token
+            decoder_input_ids = torch.zeros((1), dtype=torch.long)
+            result["decoder_input_ids"] = decoder_input_ids
+        
+        return result
 
 def load_sven_data(file_path):
     data = []
@@ -105,12 +118,88 @@ def compute_metrics(pred):
         'recall': recall
     }
 
+# Custom wrapper for CodeT5 classification
+class CodeT5ForSequenceClassification(torch.nn.Module):
+    def __init__(self, checkpoint, num_labels=2, device="cuda"):
+        super().__init__()
+        # Load T5 model directly
+        self.t5 = T5ForConditionalGeneration.from_pretrained(
+            checkpoint, 
+            trust_remote_code=True
+        ).to(device)
+        
+        # Add classification head
+        self.classifier = torch.nn.Linear(
+            self.t5.config.d_model, 
+            num_labels
+        ).to(device)
+        
+        self.device = device
+        self.num_labels = num_labels
+    
+    def forward(self, input_ids=None, attention_mask=None, decoder_input_ids=None, labels=None):
+        # T5 requires decoder_input_ids
+        if decoder_input_ids is None:
+            # Use a default decoder input if none provided
+            batch_size = input_ids.size(0)
+            decoder_input_ids = torch.zeros(
+                (batch_size, 1), 
+                dtype=torch.long, 
+                device=self.device
+            )
+        
+        # Get encoder outputs from T5
+        encoder_outputs = self.t5.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True
+        )
+        
+        # Use mean pooling of encoder hidden states for classification
+        # This is one approach; another would be to use the first token
+        hidden_states = encoder_outputs.last_hidden_state
+        pooled_output = torch.mean(hidden_states, dim=1)
+        
+        # Apply the classifier
+        logits = self.classifier(pooled_output)
+        
+        loss = None
+        if labels is not None:
+            loss_fct = torch.nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+        
+        return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
+
+def load_model_and_tokenizer(model_type, device="cuda"):
+    """
+    Load the specified model type and its tokenizer
+    """
+    if model_type == "codebert":
+        checkpoint = "microsoft/codebert-base"
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+        model = RobertaForSequenceClassification.from_pretrained(
+            checkpoint,
+            num_labels=2  # Binary classification
+        ).to(device)
+    elif model_type == "codet5":
+        checkpoint = "Salesforce/codet5p-220m-bimodal"
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
+        
+        # Create our custom CodeT5 classification model
+        model = CodeT5ForSequenceClassification(checkpoint, num_labels=2, device=device)
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}. Choose either 'codebert' or 'codet5'")
+    
+    logger.info(f"Loaded {model_type} model from {checkpoint}")
+    return model, tokenizer
+
 def main():
     # Set up configuration
     config = {
-        "model_name": "microsoft/codebert-base",
-        "data_path": "/home/coder/sven/sven.json",
-        "output_dir": "./sven_codebert_binary_model",
+        "model_type": "codet5",  # Options: "codebert" or "codet5"
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "data_path": "/home/itvkist/code/old_code/vul_check/vul_fewshot/sven_train.jsonl",
+        "output_dir": "./sven_model_output",
         "max_length": 512,
         "batch_size": 16,
         "learning_rate": 5e-5,
@@ -124,6 +213,9 @@ def main():
         "val_size": 0.1
     }
     
+    # Adjust output directory based on model type
+    config["output_dir"] = f"./sven_{config['model_type']}_binary_model"
+    
     # Set random seed
     set_random_seed(config["seed"])
     
@@ -131,13 +223,8 @@ def main():
     logger.info(f"Loading data from {config['data_path']}")
     data = load_sven_data(config["data_path"])
     
-    # Load tokenizer and model
-    logger.info(f"Loading model and tokenizer from {config['model_name']}")
-    tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
-    model = RobertaForSequenceClassification.from_pretrained(
-        config["model_name"],
-        num_labels=2  # Binary classification: 0 for vulnerable, 1 for fixed
-    )
+    # Load model and tokenizer based on the selected type
+    model, tokenizer = load_model_and_tokenizer(config["model_type"], config["device"])
     
     # Split data into train, validation, and test sets
     train_val_data, test_data = train_test_split(
@@ -153,9 +240,9 @@ def main():
     logger.info(f"Test set: {len(test_data)} examples (will be doubled for binary classification)")
     
     # Create datasets
-    train_dataset = SVENBinaryDataset(train_data, tokenizer, config["max_length"])
-    val_dataset = SVENBinaryDataset(val_data, tokenizer, config["max_length"])
-    test_dataset = SVENBinaryDataset(test_data, tokenizer, config["max_length"])
+    train_dataset = SVENBinaryDataset(train_data, tokenizer, config["max_length"], config["model_type"])
+    val_dataset = SVENBinaryDataset(val_data, tokenizer, config["max_length"], config["model_type"])
+    test_dataset = SVENBinaryDataset(test_data, tokenizer, config["max_length"], config["model_type"])
     
     logger.info(f"Final train set: {len(train_dataset)} samples")
     logger.info(f"Final validation set: {len(val_dataset)} samples")
@@ -192,7 +279,7 @@ def main():
     )
     
     # Train model
-    logger.info("Starting training")
+    logger.info(f"Starting training with {config['model_type']} model")
     trainer.train()
     
     # Evaluate on test set
@@ -202,16 +289,31 @@ def main():
     
     # Save model, tokenizer, and label mapping
     logger.info(f"Saving model to {config['output_dir']}")
-    trainer.save_model()
+    if config["model_type"] == "codebert":
+        # Standard save for HuggingFace models
+        trainer.save_model()
+    else:
+        # For CodeT5 with custom wrapper, save component parts
+        os.makedirs(config["output_dir"], exist_ok=True)
+        # Save T5 model
+        model.t5.save_pretrained(os.path.join(config["output_dir"], "t5_model"))
+        # Save classifier
+        torch.save(model.classifier.state_dict(), os.path.join(config["output_dir"], "classifier.pt"))
+    
+    # Save tokenizer
     tokenizer.save_pretrained(config["output_dir"])
     
-    # Save label information for future inference
-    label_info = {
-        "0": "vulnerable_code",
-        "1": "fixed_code"
+    # Save model configuration and label information for future inference
+    model_config = {
+        "model_type": config["model_type"],
+        "label_info": {
+            "0": "fixed_code",
+            "1": "vulnerable_code"
+        }
     }
-    with open(os.path.join(config["output_dir"], "label_info.json"), "w") as f:
-        json.dump(label_info, f)
+    
+    with open(os.path.join(config["output_dir"], "model_config.json"), "w") as f:
+        json.dump(model_config, f)
     
     # Return test results
     return test_results

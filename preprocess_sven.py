@@ -8,8 +8,8 @@ def process_sven_files(input_dir, output_file):
     """
     Process multiple SVEN data files into a single JSONL file
     """
-    # Find all JSON or JSONL files in the input directory
-    file_paths = glob.glob(os.path.join(input_dir, "*.json*"))
+    # Find all JSON or JSONL files in the input directory and its subdirectories
+    file_paths = glob.glob(os.path.join(input_dir, "**", "*.json*"), recursive=True)
     
     print(f"Found {len(file_paths)} files to process")
     

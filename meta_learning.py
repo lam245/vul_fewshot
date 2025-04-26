@@ -8,16 +8,20 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import (
     RobertaForSequenceClassification,
     AutoTokenizer,
-    AdamW,
-    get_linear_schedule_with_warmup
+    AutoModel,
+    T5ForConditionalGeneration,
+    TrainingArguments,
+    Trainer,
+    set_seed
 )
+import re
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 import copy
 import pandas as pd
 from tqdm import tqdm
-from config import *
-# Configure logging
+
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -41,75 +45,80 @@ def set_random_seed(seed=42):
         torch.cuda.manual_seed_all(seed)
     logger.info(f"Random seed set to {seed}")
 
-def filter_datasets_by_matching_vulnerability_types(sven_data, big_vul_df):
+
+
+def extract_number_from_string(s):
+    """Extract the numeric part from a string."""
+    if s is None:
+        return None
+    match = re.search(r'\d+', str(s))
+    return int(match.group()) if match else None
+
+def filter_datasets_by_matching_vulnerability_types(sven_data, big_vul_df, sven_cwe_ids=None):
     """
-    Filter both datasets to include only samples with matching vulnerability types.
-    This version directly compares CWE IDs without using a mapping, using case-insensitive matching.
+    Filter both datasets to include only samples with matching vulnerability types
+    using the extract_number_from_string function to compare CWE IDs numerically.
     
     Args:
         sven_data: List of dictionaries containing SVEN data
         big_vul_df: DataFrame containing BigVul data
+        sven_cwe_ids: List of common CWE IDs to filter by
     
     Returns:
         filtered_sven_data: Filtered SVEN data
         filtered_big_vul_df: Filtered BigVul data
         common_vuln_types: List of common vulnerability types
     """
-    # Extract unique vulnerability types from SVEN (converted to lowercase)
-    sven_vuln_types = set()
-    sven_vuln_type_map = {}  # Map to preserve original case
+    if sven_cwe_ids is None:
+        sven_cwe_ids = [22, 78, 79, 89, 125, 190, 416, 476, 787]
+    
+    # Set of allowed CWE IDs as integers
+    allowed_cwe_ids = set(sven_cwe_ids)
+    logger.info(f"Filtering for these CWE IDs: {allowed_cwe_ids}")
+    
+    # Filter SVEN data based on extracted numbers
+    filtered_sven_data = []
     for example in sven_data:
         if "vul_type" in example and example["vul_type"]:
-            lowercase_type = example["vul_type"].lower()
-            sven_vuln_types.add(lowercase_type)
-            sven_vuln_type_map[lowercase_type] = example["vul_type"]  # Remember original case
+            cwe_number = extract_number_from_string(example["vul_type"])
+            if cwe_number in allowed_cwe_ids:
+                filtered_sven_data.append(example)
     
-    # Extract unique CWE IDs from BigVul (converted to lowercase)
-    big_vul_cwe_ids = set()
-    big_vul_cwe_map = {}  # Map to preserve original case
+    # Filter BigVul data based on extracted numbers
     if "CWE ID" in big_vul_df.columns:
-        for cwe_id in big_vul_df["CWE ID"].dropna().unique():
-            lowercase_cwe = str(cwe_id).lower()
-            big_vul_cwe_ids.add(lowercase_cwe)
-            big_vul_cwe_map[lowercase_cwe] = cwe_id  # Remember original case
+        filtered_big_vul_df = big_vul_df[big_vul_df["CWE ID"].apply(
+            lambda x: extract_number_from_string(x) in allowed_cwe_ids
+        )]
     else:
         logger.warning("CWE ID column not found in BigVul dataset")
         return [], big_vul_df.iloc[0:0], []  # Return empty datasets
     
-    # Match using lowercase versions
-    common_vuln_types_lower = sven_vuln_types.intersection(big_vul_cwe_ids)
+    # Collect the actual CWE IDs found in the data
+    found_cwe_ids = set()
+    for example in filtered_sven_data:
+        cwe_number = extract_number_from_string(example["vul_type"])
+        if cwe_number:
+            found_cwe_ids.add(f"CWE-{cwe_number}")
     
-    # Convert back to original case (using BigVul's case as the standard)
-    common_vuln_types_original = [big_vul_cwe_map.get(vt, vt) for vt in common_vuln_types_lower]
+    for cwe_id in filtered_big_vul_df["CWE ID"].dropna().unique():
+        cwe_number = extract_number_from_string(cwe_id)
+        if cwe_number:
+            found_cwe_ids.add(f"CWE-{cwe_number}")
     
-    logger.info(f"Found {len(common_vuln_types_original)} common vulnerability types: {common_vuln_types_original}")
+    common_vuln_types = sorted(list(found_cwe_ids))
     
-    if not common_vuln_types_original:
-        logger.warning("No common vulnerability types found between datasets")
-        return [], big_vul_df.iloc[0:0], []
-    
-    # Create a set of lowercase common types for efficient lookup
-    common_vuln_types_lower_set = set(common_vuln_types_lower)
-    
-    # Filter SVEN data (case-insensitive matching)
-    filtered_sven_data = [
-        example for example in sven_data 
-        if "vul_type" in example and example["vul_type"] and example["vul_type"].lower() in common_vuln_types_lower_set
-    ]
-    
-    # Filter BigVul data (case-insensitive matching)
-    filtered_big_vul_df = big_vul_df[big_vul_df["CWE ID"].astype(str).str.lower().isin(common_vuln_types_lower_set)]
-    
+    logger.info(f"Found {len(common_vuln_types)} common vulnerability types: {common_vuln_types}")
     logger.info(f"Filtered SVEN data: {len(filtered_sven_data)} samples")
     logger.info(f"Filtered BigVul data: {len(filtered_big_vul_df)} samples")
     
-    return filtered_sven_data, filtered_big_vul_df, common_vuln_types_original
+    return filtered_sven_data, filtered_big_vul_df, common_vuln_types
 
 class VulnerabilityDataset(Dataset):
-    def __init__(self, examples, tokenizer, max_length=512, is_bigvul=False):
+    def __init__(self, examples, tokenizer, max_length=512, is_bigvul=False, model_type="codebert"):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.is_bigvul = is_bigvul
+        self.model_type = model_type
         
         # Store processed examples
         self.processed_examples = []
@@ -157,11 +166,20 @@ class VulnerabilityDataset(Dataset):
         input_ids = inputs["input_ids"].squeeze()
         attention_mask = inputs["attention_mask"].squeeze()
         
-        return {
+        result = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": torch.tensor(example["label"], dtype=torch.long)
         }
+        
+        # For CodeT5, add decoder_input_ids
+        if self.model_type == "codet5":
+            # For classification, we don't need meaningful decoder inputs
+            # Just use a simple start token
+            decoder_input_ids = torch.zeros((1), dtype=torch.long)
+            result["decoder_input_ids"] = decoder_input_ids
+        
+        return result
 
 def load_sven_data(file_path):
     data = []
@@ -210,11 +228,61 @@ def compute_metrics(labels, preds):
         'precision': precision,
         'recall': recall
     }
-
+# Custom wrapper for CodeT5 classification
+class CodeT5ForSequenceClassification(torch.nn.Module):
+    def __init__(self, checkpoint, num_labels=2, device="cuda"):
+        super().__init__()
+        # Load T5 model directly
+        self.t5 = T5ForConditionalGeneration.from_pretrained(
+            checkpoint, 
+            trust_remote_code=True
+        ).to(device)
+        
+        # Add classification head
+        self.classifier = torch.nn.Linear(
+            self.t5.config.d_model, 
+            num_labels
+        ).to(device)
+        
+        self.device = device
+        self.num_labels = num_labels
+    
+    def forward(self, input_ids=None, attention_mask=None, decoder_input_ids=None, labels=None):
+        # T5 requires decoder_input_ids
+        if decoder_input_ids is None:
+            # Use a default decoder input if none provided
+            batch_size = input_ids.size(0)
+            decoder_input_ids = torch.zeros(
+                (batch_size, 1), 
+                dtype=torch.long, 
+                device=self.device
+            )
+        
+        # Get encoder outputs from T5
+        encoder_outputs = self.t5.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True
+        )
+        
+        # Use mean pooling of encoder hidden states for classification
+        hidden_states = encoder_outputs.last_hidden_state
+        pooled_output = torch.mean(hidden_states, dim=1)
+        
+        # Apply the classifier
+        logits = self.classifier(pooled_output)
+        
+        loss = None
+        if labels is not None:
+            loss_fct = torch.nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+        
+        return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
 class MAMLForVulnerabilityDetection:
     def __init__(
         self, 
         model_name, 
+        model_type="codebert",  # New parameter to specify model type
         inner_lr=0.01, 
         outer_lr=0.001, 
         num_inner_steps=5,
@@ -223,6 +291,7 @@ class MAMLForVulnerabilityDetection:
         device=None
     ):
         self.model_name = model_name
+        self.model_type = model_type
         self.inner_lr = inner_lr
         self.outer_lr = outer_lr
         self.num_inner_steps = num_inner_steps
@@ -230,12 +299,24 @@ class MAMLForVulnerabilityDetection:
         self.meta_batch_size = meta_batch_size
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Initialize model and tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = RobertaForSequenceClassification.from_pretrained(
-            model_name,
-            num_labels=2  # Binary classification
-        ).to(self.device)
+        # Initialize tokenizer based on model type
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=(model_type=="codet5"))
+        
+        # Initialize model based on model type
+        if model_type == "codebert":
+            self.model = RobertaForSequenceClassification.from_pretrained(
+                model_name,
+                num_labels=2  # Binary classification
+            ).to(self.device)
+        elif model_type == "codet5":
+            # Use our custom CodeT5 wrapper
+            self.model = CodeT5ForSequenceClassification(
+                model_name, 
+                num_labels=2, 
+                device=self.device
+            )
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}. Choose either 'codebert' or 'codet5'")
         
         # Initialize optimizer
         self.meta_optimizer = AdamW(self.model.parameters(), lr=self.outer_lr)
@@ -255,14 +336,27 @@ class MAMLForVulnerabilityDetection:
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
                 
-                # Forward pass
-                outputs = task_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
-                
-                loss = outputs.loss
+                # Forward pass - handle different model types
+                if self.model_type == "codebert":
+                    outputs = task_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
+                    loss = outputs.loss
+                else:  # codet5
+                    # Get decoder_input_ids if available
+                    decoder_input_ids = batch.get("decoder_input_ids", None)
+                    if decoder_input_ids is not None:
+                        decoder_input_ids = decoder_input_ids.to(self.device)
+                    
+                    outputs = task_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        decoder_input_ids=decoder_input_ids,
+                        labels=labels
+                    )
+                    loss = outputs["loss"]
                 
                 # Backward pass and update
                 task_optimizer.zero_grad()
@@ -285,18 +379,33 @@ class MAMLForVulnerabilityDetection:
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
                 
-                # Forward pass
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
+                # Forward pass - handle different model types
+                if self.model_type == "codebert":
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
+                    loss = outputs.loss
+                    logits = outputs.logits
+                else:  # codet5
+                    # Get decoder_input_ids if available
+                    decoder_input_ids = batch.get("decoder_input_ids", None)
+                    if decoder_input_ids is not None:
+                        decoder_input_ids = decoder_input_ids.to(self.device)
+                    
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        decoder_input_ids=decoder_input_ids,
+                        labels=labels
+                    )
+                    loss = outputs["loss"]
+                    logits = outputs["logits"]
                 
-                loss = outputs.loss
                 total_loss += loss.item()
                 
                 # Get predictions
-                logits = outputs.logits
                 preds = torch.argmax(logits, dim=1).cpu().numpy()
                 labels = labels.cpu().numpy()
                 
@@ -343,15 +452,29 @@ class MAMLForVulnerabilityDetection:
                         attention_mask = batch["attention_mask"].to(self.device)
                         labels = batch["labels"].to(self.device)
                         
-                        # Forward pass
-                        outputs = updated_task_model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            labels=labels
-                        )
+                        # Forward pass - handle different model types
+                        if self.model_type == "codebert":
+                            outputs = updated_task_model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                labels=labels
+                            )
+                            task_loss = outputs.loss
+                        else:  # codet5
+                            # Get decoder_input_ids if available
+                            decoder_input_ids = batch.get("decoder_input_ids", None)
+                            if decoder_input_ids is not None:
+                                decoder_input_ids = decoder_input_ids.to(self.device)
+                            
+                            outputs = updated_task_model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                decoder_input_ids=decoder_input_ids,
+                                labels=labels
+                            )
+                            task_loss = outputs["loss"]
                         
                         # Accumulate loss
-                        task_loss = outputs.loss
                         query_loss += task_loss
                     
                     # Get average loss for this task
@@ -414,14 +537,28 @@ class MAMLForVulnerabilityDetection:
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
                 
-                # Forward pass
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
+                # Forward pass - handle different model types
+                if self.model_type == "codebert":
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
+                    loss = outputs.loss
+                else:  # codet5
+                    # Get decoder_input_ids if available
+                    decoder_input_ids = batch.get("decoder_input_ids", None)
+                    if decoder_input_ids is not None:
+                        decoder_input_ids = decoder_input_ids.to(self.device)
+                    
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        decoder_input_ids=decoder_input_ids,
+                        labels=labels
+                    )
+                    loss = outputs["loss"]
                 
-                loss = outputs.loss
                 train_loss += loss.item()
                 
                 # Backward pass and update
@@ -461,16 +598,29 @@ class MAMLForVulnerabilityDetection:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         
-        self.model.save_pretrained(output_dir)
+        # Save model based on type
+        if self.model_type == "codebert":
+            self.model.save_pretrained(output_dir)
+        else:  # codet5
+            # Save T5 model
+            self.model.t5.save_pretrained(os.path.join(output_dir, "t5_model"))
+            # Save classifier
+            torch.save(self.model.classifier.state_dict(), os.path.join(output_dir, "classifier.pt"))
+        
+        # Save tokenizer
         self.tokenizer.save_pretrained(output_dir)
         
-        label_info = {
-            "0": "vulnerable_code",
-            "1": "fixed_code"
+        # Save model config with label info
+        model_config = {
+            "model_type": self.model_type,
+            "label_info": {
+                "0": "fixed_code",
+                "1": "vulnerable_code"
+            }
         }
         
-        with open(os.path.join(output_dir, "label_info.json"), "w") as f:
-            json.dump(label_info, f)
+        with open(os.path.join(output_dir, "model_config.json"), "w") as f:
+            json.dump(model_config, f)
         
         logger.info(f"Model saved to {output_dir}")
 
@@ -533,7 +683,34 @@ def create_sven_task(sven_data, tokenizer, max_length=512):
 
 def main():
     # Set configuration
-    config = config
+    config = {
+        "model_type": "codet5",  # Options: "codebert" or "codet5"
+        "model_name": "Salesforce/codet5p-220m-bimodal",
+        "sven_data_path": "/home/itvkist/code/old_code/vul_check/vul_fewshot/sven_train.jsonl",
+        "big_vul_data_path": "/home/itvkist/code/old_code/vul_check/MSR_data_cleaned.csv",
+        "output_dir": "./meta_learning_vul_model",
+        "max_length": 512,
+        "batch_size": 8,            
+        "inner_lr": 0.01,           
+        "outer_lr": 0.0005,          
+        "ft_lr": 2e-5,              
+        "num_inner_steps": 4,        
+        "meta_batch_size": 2,        
+        "n_meta_tasks": 30,         
+        "k_shot": 6,                 
+        "big_vul_sample_size": 5000, 
+        "meta_epochs": 3,           
+        "ft_epochs": 10,             
+        "seed": 42,
+        "warmup_ratio": 0.1,         
+        "weight_decay": 0.01,        
+        "early_stopping_patience": 5, 
+        "class_weights": [0.5, 0.5],
+        "use_vulnerability_type_matching": True  # Enable matching by vulnerability type
+    }
+    
+    # Adjust output directory based on model type
+    config["output_dir"] = f"{config['output_dir']}_{config['model_type']}"
     
     # Set random seed
     set_random_seed(config["seed"])
@@ -565,9 +742,10 @@ def main():
         # Update output directory to reflect filtered dataset
         config["output_dir"] = f"{config['output_dir']}_filtered_by_vul_type"
     
-    # Initialize MAML
+    # Initialize MAML with selected model type
     maml = MAMLForVulnerabilityDetection(
         model_name=config["model_name"],
+        model_type=config["model_type"],
         inner_lr=config["inner_lr"],
         outer_lr=config["outer_lr"],
         num_inner_steps=config["num_inner_steps"],
@@ -576,30 +754,55 @@ def main():
     )
     
     # Create meta-tasks from Big-Vul
+    # Update the create_meta_tasks function to accept model_type
     big_vul_tasks = create_meta_tasks(
         big_vul_df, 
         maml.tokenizer, 
         n_tasks=config["n_meta_tasks"], 
         k_shot=config["k_shot"], 
-        max_length=config["max_length"]
+        max_length=config["max_length"],
+        model_type=config["model_type"]
     )
     
     # Create target task from SVEN
-    sven_task = create_sven_task(sven_data, maml.tokenizer, max_length=config["max_length"])
+    # Update the create_sven_task function to accept model_type
+    sven_task = create_sven_task(
+        sven_data, 
+        maml.tokenizer, 
+        max_length=config["max_length"],
+        model_type=config["model_type"]
+    )
     
     # Split SVEN data for fine-tuning and evaluation
     train_val_data, test_data = train_test_split(sven_data, test_size=0.2, random_state=config["seed"])
     train_data, val_data = train_test_split(train_val_data, test_size=0.2, random_state=config["seed"])
     
     # Create datasets for fine-tuning and evaluation
-    train_dataset = VulnerabilityDataset(train_data, maml.tokenizer, max_length=config["max_length"])
-    val_dataset = VulnerabilityDataset(val_data, maml.tokenizer, max_length=config["max_length"])
-    test_dataset = VulnerabilityDataset(test_data, maml.tokenizer, max_length=config["max_length"])
+    train_dataset = VulnerabilityDataset(
+        train_data, 
+        maml.tokenizer, 
+        max_length=config["max_length"],
+        model_type=config["model_type"]
+    )
+    val_dataset = VulnerabilityDataset(
+        val_data, 
+        maml.tokenizer, 
+        max_length=config["max_length"],
+        model_type=config["model_type"]
+    )
+    test_dataset = VulnerabilityDataset(
+        test_data, 
+        maml.tokenizer, 
+        max_length=config["max_length"],
+        model_type=config["model_type"]
+    )
     
     # Create dataloaders
     train_dataloader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
     val_dataloader = DataLoader(val_dataset, batch_size=config["batch_size"])
     test_dataloader = DataLoader(test_dataset, batch_size=config["batch_size"])
+    
+   
     
     # Meta-training phase
     logger.info("Starting meta-training phase")
